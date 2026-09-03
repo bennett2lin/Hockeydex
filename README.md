@@ -8,7 +8,7 @@ Built by [bennett2lin](https://github.com/bennett2lin).
 ## What it does
 
 - Search any skater or goalie by full name, first name, or last name
-- See a JFresh-style percentile card: 8 key stats for skaters, 4 for
+- See a percentile bar graph: 8 key stats for skaters, 4 for
   goalies, each ranked against same-role peers, plus real season totals
   (GP, goals, assists, points, PIM, TOI / save %, GAA)
 - Browse a sortable, full-league leaderboard for any season -- click any
