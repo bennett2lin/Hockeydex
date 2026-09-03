@@ -17,19 +17,7 @@ Built by [bennett2lin](https://github.com/bennett2lin).
   MoneyPuck, no manual downloads required
 - Read a plain-language glossary explaining every stat, directly in the app
 
-## Running it locally
 
-```
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Methodology & limitations
-
-Every stat's formula, the reasoning behind position-group comparisons and
-sample-size cutoffs, and an honest list of what's deliberately left out
-(Competition/Teammates, goalie start-quality stats, plus/minus, salary
-data) is documented in [METHODOLOGY.md](METHODOLOGY.md).
 
 ## Data source
 
