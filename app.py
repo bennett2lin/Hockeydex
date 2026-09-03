@@ -1,11 +1,5 @@
 """
 app.py -- Hockeydex, by bennett2lin.
-
-Run locally with:
-    streamlit run app.py
-
-Deploy for free by pushing this file to a GitHub repo, then connecting
-that repo at share.streamlit.io (Streamlit Community Cloud).
 """
 import io
 import requests
@@ -15,19 +9,11 @@ import matplotlib.pyplot as plt
 
 
 def fetch_csv(url: str) -> pd.DataFrame:
-    """Some sites (MoneyPuck included) block plain requests that don't look
-    like they're coming from a real browser -- pandas' default CSV fetcher
-    sends no User-Agent header at all, which can trigger a 403. Fetching
-    the raw text ourselves with a browser-like header first sidesteps that."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; HockeyPercentileApp/1.0)"}
     response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
     return pd.read_csv(io.StringIO(response.text))
 
-
-# ---------------------------------------------------------------------
-# STEP 1: Percentile-building functions.
-# ---------------------------------------------------------------------
 
 @st.cache_data(ttl=3600)
 def build_percentiles(csv_path, min_gp=20):
@@ -144,10 +130,6 @@ def get_player_card(name, skater_league, goalie_league):
         return None, None
 
 
-# ---------------------------------------------------------------------
-# STEP 2: The chart function.
-# ---------------------------------------------------------------------
-
 SKATER_LABELS = {
     "ev_offence_pctl": "EV Offence", "ev_defence_pctl": "EV Defence",
     "pp_pctl": "PP", "pk_pctl": "PK", "finishing_pctl": "Finishing",
@@ -192,7 +174,10 @@ def plot_player_card(row, stat_labels):
 
 
 def render_player_card(kind, row):
-    st.subheader(f"{row['name']} ({row['team']}) -- {SEASON_LABEL} {'Skater' if kind == 'skater' else 'Goalie'}")
+    if kind == "skater":
+        st.subheader(f"{row['name']} ({row['position']}, {row['team']}) -- {SEASON_LABEL} Skater")
+    else:
+        st.subheader(f"{row['name']} (G, {row['team']}) -- {SEASON_LABEL} Goalie")
 
     if kind == "skater":
         col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -212,9 +197,74 @@ def render_player_card(kind, row):
     fig = plot_player_card(row, labels)
     st.pyplot(fig)
 
+    render_three_year_trend(kind, row['name'])
+
+
+TREND_STATS = {
+    "skater": [
+        ("ev_offence_pctl", "EV Offence", "#4a9de0"),
+        ("ev_defence_pctl", "EV Defence", "#d64550"),
+        ("finishing_pctl", "Finishing", "#f2f2f2"),
+    ],
+    "goalie": [
+        ("ev_gsax_pctl", "EV GSAx", "#4a9de0"),
+        ("high_danger_pctl", "High Danger", "#d64550"),
+        ("rebound_pctl", "Rebound Control", "#f2f2f2"),
+    ],
+}
+
+
+def get_recent_seasons_history(name, kind, start_year, num_seasons=3, max_lookback=8):
+    history = []
+    year = start_year
+    attempts = 0
+    while len(history) < num_seasons and attempts < max_lookback and year >= EARLIEST_SEASON_START_YEAR:
+        season_label = f"{year}-{str(year + 1)[-2:]}"
+        try:
+            if kind == "skater":
+                url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{year}/regular/skaters.csv"
+                league = build_percentiles(url)
+            else:
+                url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{year}/regular/goalies.csv"
+                league = build_goalie_percentiles(url)
+            match = league[league["name"] == name]
+            if not match.empty:
+                history.append((season_label, match.iloc[0]))
+        except Exception:
+            pass
+        year -= 1
+        attempts += 1
+    history.reverse()
+    return history
+
+
+def plot_trend_chart(history, kind):
+    fig, ax = plt.subplots(figsize=(7, 4))
+    seasons = [season for season, _ in history]
+
+    for key, label, color in TREND_STATS[kind]:
+        values = [row.get(key, None) for _, row in history]
+        ax.plot(seasons, values, marker="o", label=label, color=color)
+
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Percentile")
+    ax.set_title("3-Season Trend")
+    ax.legend()
+    plt.tight_layout()
+    return fig
+
+
+def render_three_year_trend(kind, name):
+    history = get_recent_seasons_history(name, kind, selected_start_year)
+    if len(history) == 0:
+        st.caption("No prior-season data available for this player yet.")
+        return
+    fig = plot_trend_chart(history, kind)
+    st.pyplot(fig)
+
 
 # ---------------------------------------------------------------------
-# STEP 3: The Streamlit interface.
+# The Streamlit interface.
 # ---------------------------------------------------------------------
 
 st.title("Hockeydex")
@@ -226,26 +276,6 @@ st.markdown("""
 [data-testid="stMetricLabel"] { font-size: 0.75rem; }
 </style>
 """, unsafe_allow_html=True)
-
-MOST_RECENT_SEASON_START_YEAR = 2025
-EARLIEST_SEASON_START_YEAR = 2008
-
-season_start_years = list(range(MOST_RECENT_SEASON_START_YEAR, EARLIEST_SEASON_START_YEAR - 1, -1))
-season_labels = [f"{y}-{str(y + 1)[-2:]}" for y in season_start_years]
-
-query_params = st.query_params
-linked_player = query_params.get("player")
-linked_season = query_params.get("season")
-
-default_season_index = 0
-if linked_season in season_labels:
-    default_season_index = season_labels.index(linked_season)
-
-SEASON_LABEL = st.selectbox("Season:", season_labels, index=default_season_index)
-selected_start_year = int(SEASON_LABEL.split("-")[0])
-
-SKATERS_URL = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{selected_start_year}/regular/skaters.csv"
-GOALIES_URL = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{selected_start_year}/regular/goalies.csv"
 
 with st.expander("What do these stats mean? (click to expand)"):
     st.markdown("""
@@ -285,6 +315,26 @@ left out rather than faked.
 **Not included:** Quality Start %, Really Good/Bad Start %, and year-over-year Consistency --
 these need individual game-by-game logs, not season totals, so they're left out.
 """)
+
+MOST_RECENT_SEASON_START_YEAR = 2025
+EARLIEST_SEASON_START_YEAR = 2008
+
+season_start_years = list(range(MOST_RECENT_SEASON_START_YEAR, EARLIEST_SEASON_START_YEAR - 1, -1))
+season_labels = [f"{y}-{str(y + 1)[-2:]}" for y in season_start_years]
+
+query_params = st.query_params
+linked_player = query_params.get("player")
+linked_season = query_params.get("season")
+
+default_season_index = 0
+if linked_season in season_labels:
+    default_season_index = season_labels.index(linked_season)
+
+SEASON_LABEL = st.selectbox("Season:", season_labels, index=default_season_index)
+selected_start_year = int(SEASON_LABEL.split("-")[0])
+
+SKATERS_URL = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{selected_start_year}/regular/skaters.csv"
+GOALIES_URL = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{selected_start_year}/regular/goalies.csv"
 
 try:
     skater_league = build_percentiles(SKATERS_URL)
@@ -334,24 +384,29 @@ GOALIE_LEADERBOARD_COLUMNS = {
 }
 
 st.header("Leaderboard")
-st.caption("Click any column header to sort. Click a player's name to view their card above.")
 
 leaderboard_kind = st.radio("Show:", ["Skaters", "Goalies"], horizontal=True)
 
 if leaderboard_kind == "Skaters":
     columns_map = SKATER_LEADERBOARD_COLUMNS
     source_league = skater_league
+
+    position_filter = st.selectbox("Filter by position:", ["All", "C", "L", "R", "D"])
+    if position_filter != "All":
+        source_league = source_league[source_league["position"] == position_filter]
+
+    leaderboard = source_league[["name", "position", "team"] + list(columns_map.keys())].copy()
 else:
     columns_map = GOALIE_LEADERBOARD_COLUMNS
     source_league = goalie_league
-
-leaderboard = source_league[["name", "team"] + list(columns_map.keys())].copy()
+    leaderboard = source_league[["name", "team"] + list(columns_map.keys())].copy()
 
 leaderboard["name"] = leaderboard["name"].apply(
     lambda n: f"?player={n}&season={SEASON_LABEL}"
 )
 
-leaderboard = leaderboard.rename(columns={"name": "Name", "team": "Team", **columns_map})
+rename_map = {"name": "Name", "team": "Team", "position": "Pos", **columns_map}
+leaderboard = leaderboard.rename(columns=rename_map)
 leaderboard = leaderboard.round(3)
 
 st.dataframe(
