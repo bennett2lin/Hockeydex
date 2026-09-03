@@ -1,4 +1,4 @@
-# Hockeydex - https://github.com/bennett2lin/Hockeydex](https://hockeydex.streamlit.app/
+# Hockeydex - hockeydex.streamlit.app
 
 Live NHL percentile cards and leaderboards for any skater or goalie, any
 season since 2008-09, built with Streamlit and MoneyPuck data.
