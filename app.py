@@ -1,5 +1,11 @@
 """
-app.py -- Hockeydex, by bennett2lin.
+app.py -- Streamlit interface for the skater/goalie percentile project.
+
+Run locally with:
+    streamlit run app.py
+
+Deploy for free by pushing this file + your CSVs to a GitHub repo, then
+connecting that repo at share.streamlit.io (Streamlit Community Cloud).
 """
 import io
 import requests
@@ -9,17 +15,34 @@ import matplotlib.pyplot as plt
 
 
 def fetch_csv(url: str) -> pd.DataFrame:
+    """Some sites (MoneyPuck included) block plain requests that don't look
+    like they're coming from a real browser -- pandas' default CSV fetcher
+    sends no User-Agent header at all, which can trigger a 403. Fetching
+    the raw text ourselves with a browser-like header first sidesteps that."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; HockeyPercentileApp/1.0)"}
     response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
     return pd.read_csv(io.StringIO(response.text))
 
 
-@st.cache_data(ttl=3600)
-def build_percentiles(csv_path, min_gp=20):
+# ---------------------------------------------------------------------
+# STEP 1: Your existing percentile-building functions, unchanged.
+# (Paste your real, working versions here -- these are exactly what
+# you already built and tested in Colab.)
+# ---------------------------------------------------------------------
+
+@st.cache_data(ttl=3600)  # refresh from MoneyPuck at most once per hour
+def build_percentiles(csv_path, min_gp=None):
     df = fetch_csv(csv_path)
     df['games_played'] = pd.to_numeric(df['games_played'], errors='coerce')
     df = df.dropna(subset=['games_played'])
+    if min_gp is None:
+        # Scale the cutoff to how far this season has actually progressed,
+        # so early in a new season the leaderboard isn't empty waiting for
+        # a fixed 20-game bar. Capped at 20 so a nearly-finished season
+        # behaves exactly like the original fixed threshold, not stricter.
+        max_gp_this_season = df['games_played'].max()
+        min_gp = max(1, min(20, int(max_gp_this_season * 0.5)))
     df = df[df['games_played'] >= min_gp]
     df['position_group'] = df['position'].apply(lambda p: 'F' if p in ['C', 'R', 'L'] else 'D')
 
@@ -61,6 +84,9 @@ def build_percentiles(csv_path, min_gp=20):
     result = result.merge(pp[['playerId', 'pp_pctl']], on='playerId', how='left')
     result = result.merge(pk[['playerId', 'pk_pctl']], on='playerId', how='left')
 
+    # --- Real season totals, for display alongside the percentiles ---
+    # Uses the 'all' situation rows -- every strength combined -- so these
+    # match what you'd see on a normal stats sheet (not just 5v5).
     season_totals = df[df['situation'] == 'all'].copy()
     season_totals['season_goals'] = season_totals['I_F_goals']
     season_totals['season_assists'] = season_totals['I_F_primaryAssists'] + season_totals['I_F_secondaryAssists']
@@ -74,9 +100,12 @@ def build_percentiles(csv_path, min_gp=20):
     return result
 
 
-@st.cache_data(ttl=3600)
-def build_goalie_percentiles(csv_path, min_gp=10):
+@st.cache_data(ttl=3600)  # refresh from MoneyPuck at most once per hour
+def build_goalie_percentiles(csv_path, min_gp=None):
     goalies_df = fetch_csv(csv_path)
+    if min_gp is None:
+        max_gp_this_season = goalies_df['games_played'].max()
+        min_gp = max(1, min(10, int(max_gp_this_season * 0.5)))
     goalies_df = goalies_df[goalies_df['games_played'] >= min_gp]
 
     ev_goalies = goalies_df[goalies_df['situation'] == '5on5'].copy()
@@ -104,6 +133,7 @@ def build_goalie_percentiles(csv_path, min_gp=10):
                           'ev_gsax_pctl', 'high_danger_pctl', 'rebound_pctl']].copy()
     result = result.merge(pk_goalies[['playerId', 'pk_gsax_pctl']], on='playerId', how='left')
 
+    # --- Real season totals, for display alongside the percentiles ---
     season_totals = goalies_df[goalies_df['situation'] == 'all'].copy()
     season_totals['save_pct'] = 1 - (season_totals['goals'] / season_totals['ongoal'])
     season_totals['gaa'] = season_totals['goals'] / season_totals['icetime'] * 3600
@@ -114,12 +144,17 @@ def build_goalie_percentiles(csv_path, min_gp=10):
 
 
 def find_players(name, skater_league, goalie_league):
+    """Partial, case-insensitive match -- supports full name, first name,
+    or last name only. Returns (skater_matches, goalie_matches), each a
+    DataFrame that may have 0, 1, or several rows."""
     skater_matches = skater_league[skater_league['name'].str.contains(name, case=False, na=False)]
     goalie_matches = goalie_league[goalie_league['name'].str.contains(name, case=False, na=False)]
     return skater_matches, goalie_matches
 
 
 def get_player_card(name, skater_league, goalie_league):
+    """Exact-name lookup, used once a single player has been chosen
+    (e.g. from a dropdown after a partial search)."""
     skater_match = skater_league[skater_league['name'] == name]
     goalie_match = goalie_league[goalie_league['name'] == name]
     if not skater_match.empty:
@@ -129,6 +164,10 @@ def get_player_card(name, skater_league, goalie_league):
     else:
         return None, None
 
+
+# ---------------------------------------------------------------------
+# STEP 2: The chart function, adapted from what we just tested.
+# ---------------------------------------------------------------------
 
 SKATER_LABELS = {
     "ev_offence_pctl": "EV Offence", "ev_defence_pctl": "EV Defence",
@@ -174,6 +213,9 @@ def plot_player_card(row, stat_labels):
 
 
 def render_player_card(kind, row):
+    """Draws the full card -- subheader, basic-stat metrics, percentile
+    chart -- for one player. Used by both the search box and by clicking
+    a row in the leaderboard, so both paths look identical."""
     if kind == "skater":
         st.subheader(f"{row['name']} ({row['position']}, {row['team']}) -- {SEASON_LABEL} Skater")
     else:
@@ -215,6 +257,11 @@ TREND_STATS = {
 
 
 def get_recent_seasons_history(name, kind, start_year, num_seasons=3, max_lookback=8):
+    """Walk backward from start_year, collecting up to num_seasons where
+    this player actually qualified (enough games played that season).
+    Skips seasons where the player doesn't appear (injury, not yet in the
+    league, retired, etc.) rather than counting them toward the total, so
+    a player with gaps still gets their real last 3 qualifying seasons."""
     history = []
     year = start_year
     attempts = 0
@@ -231,10 +278,10 @@ def get_recent_seasons_history(name, kind, start_year, num_seasons=3, max_lookba
             if not match.empty:
                 history.append((season_label, match.iloc[0]))
         except Exception:
-            pass
+            pass  # that season's file isn't available -- just skip it
         year -= 1
         attempts += 1
-    history.reverse()
+    history.reverse()  # oldest to newest, left-to-right on the chart
     return history
 
 
@@ -264,12 +311,14 @@ def render_three_year_trend(kind, name):
 
 
 # ---------------------------------------------------------------------
-# The Streamlit interface.
+# STEP 3: The actual Streamlit interface. This part is new syntax.
 # ---------------------------------------------------------------------
 
 st.title("Hockeydex")
 st.caption("by [bennett2lin](https://github.com/bennett2lin) -- Source: MoneyPuck")
 
+# Shrink st.metric's default font sizes so 6 stat boxes fit comfortably
+# in one row instead of wrapping or looking oversized.
 st.markdown("""
 <style>
 [data-testid="stMetricValue"] { font-size: 1.1rem; }
@@ -316,12 +365,15 @@ left out rather than faked.
 these need individual game-by-game logs, not season totals, so they're left out.
 """)
 
-MOST_RECENT_SEASON_START_YEAR = 2025
-EARLIEST_SEASON_START_YEAR = 2008
+MOST_RECENT_SEASON_START_YEAR = 2025  # bump this once each year when a new season begins
+EARLIEST_SEASON_START_YEAR = 2008     # MoneyPuck's data goes back to the 2008-09 season
 
 season_start_years = list(range(MOST_RECENT_SEASON_START_YEAR, EARLIEST_SEASON_START_YEAR - 1, -1))
 season_labels = [f"{y}-{str(y + 1)[-2:]}" for y in season_start_years]
 
+# A clicked leaderboard link reloads the page with ?player=...&season=... in
+# the URL. Read that here so the season dropdown lands on the right season
+# and we know which player to jump straight to, further down.
 query_params = st.query_params
 linked_player = query_params.get("player")
 linked_season = query_params.get("season")
@@ -348,6 +400,10 @@ except Exception as e:
     )
     st.stop()
 
+# ---------------------------------------------------------------------
+# Search box, above the leaderboard.
+# ---------------------------------------------------------------------
+
 name = st.text_input("Search a player name:", placeholder="e.g. Celebrini, or just Mac")
 
 chosen_name = None
@@ -362,12 +418,18 @@ if name:
     else:
         chosen_name = st.selectbox("Multiple matches found -- pick one:", all_names)
 elif linked_player:
+    # No search typed -- came here by clicking a name in the leaderboard instead.
     chosen_name = linked_player
 
 if chosen_name:
     kind, row = get_player_card(chosen_name, skater_league, goalie_league)
     if row is not None:
         render_player_card(kind, row)
+
+# ---------------------------------------------------------------------
+# Leaderboard: browse the whole league, sorted by any column. Click a
+# player's name to jump straight to their card above.
+# ---------------------------------------------------------------------
 
 SKATER_LEADERBOARD_COLUMNS = {
     "games_played": "GP", "season_goals": "Goals", "season_assists": "Assists",
@@ -401,6 +463,10 @@ else:
     source_league = goalie_league
     leaderboard = source_league[["name", "team"] + list(columns_map.keys())].copy()
 
+# Turn the player name into a link back to this same app, carrying the
+# player's name and the current season as URL query parameters. When
+# clicked, the page reloads with those params set, which the code above
+# reads back via st.query_params to know who to show.
 leaderboard["name"] = leaderboard["name"].apply(
     lambda n: f"?player={n}&season={SEASON_LABEL}"
 )
