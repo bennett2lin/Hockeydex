@@ -35,10 +35,6 @@ def build_percentiles(csv_path, min_gp=None):
     df['games_played'] = pd.to_numeric(df['games_played'], errors='coerce')
     df = df.dropna(subset=['games_played'])
     if min_gp is None:
-        # Scale the cutoff to how far this season has actually progressed,
-        # so early in a new season the leaderboard isn't empty waiting for
-        # a fixed 20-game bar. Capped at 20 so a nearly-finished season
-        # behaves exactly like the original fixed threshold, not stricter.
         max_gp_this_season = df['games_played'].max()
         min_gp = max(1, min(20, int(max_gp_this_season * 0.5)))
     df = df[df['games_played'] >= min_gp]
