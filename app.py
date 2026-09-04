@@ -26,9 +26,7 @@ def fetch_csv(url: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------
-# STEP 1: Your existing percentile-building functions, unchanged.
-# (Paste your real, working versions here -- these are exactly what
-# you already built and tested in Colab.)
+# STEP 1: Percentile-building functions.
 # ---------------------------------------------------------------------
 
 @st.cache_data(ttl=3600)  # refresh from MoneyPuck at most once per hour
@@ -67,21 +65,109 @@ def build_percentiles(csv_path, min_gp=None):
     ev['net_pens_per60'] = (ev['penaltiesDrawn'] - ev['penalties']) / ev['icetime'] * 3600
     ev['penalties_pctl'] = ev.groupby('position_group')['net_pens_per60'].rank(pct=True) * 100
 
+    # --- Granular defensive stats, computed for both positions (ranked
+    # within position_group so F compares to F, D compares to D) ---
+    ev['blocks_per60'] = ev['shotsBlockedByPlayer'] / ev['icetime'] * 3600
+    ev['takeaways_per60'] = ev['I_F_takeaways'] / ev['icetime'] * 3600
+    ev['hd_xga_per60'] = ev['OnIce_A_highDangerxGoals'] / ev['icetime'] * 3600
+    ev['md_xga_per60'] = ev['OnIce_A_mediumDangerxGoals'] / ev['icetime'] * 3600
+    ev['ld_xga_per60'] = ev['OnIce_A_lowDangerxGoals'] / ev['icetime'] * 3600
+    ev['hits_per60'] = ev['I_F_hits'] / ev['icetime'] * 3600
+    ev['blocks_pctl'] = ev.groupby('position_group')['blocks_per60'].rank(pct=True) * 100
+    ev['takeaways_pctl'] = ev.groupby('position_group')['takeaways_per60'].rank(pct=True) * 100
+    ev['hd_def_pctl'] = 100 - (ev.groupby('position_group')['hd_xga_per60'].rank(pct=True) * 100)
+    ev['md_def_pctl'] = 100 - (ev.groupby('position_group')['md_xga_per60'].rank(pct=True) * 100)
+    ev['ld_def_pctl'] = 100 - (ev.groupby('position_group')['ld_xga_per60'].rank(pct=True) * 100)
+    ev['hits_pctl'] = ev.groupby('position_group')['hits_per60'].rank(pct=True) * 100
+
+    # Fenwick Rel / xG Rel: does the team's overall play (shot volume /
+    # shot quality share) actually improve when this player is on the ice,
+    # vs. off it? A check against sheltered stat-padding -- a player can
+    # accumulate individual points via easy deployment/strong linemates
+    # without genuinely driving the team's offense; Rel stats catch that.
+    # Validated for both positions (Marchand for F, Hedman for D both
+    # showed inflated raw production but weak Rel).
+    ev['fenwick_rel'] = ev['onIce_fenwickPercentage'] - ev['offIce_fenwickPercentage']
+    ev['xg_rel'] = ev['onIce_xGoalsPercentage'] - ev['offIce_xGoalsPercentage']
+    ev['fenwick_rel_pctl'] = ev.groupby('position_group')['fenwick_rel'].rank(pct=True) * 100
+    ev['xg_rel_pctl'] = ev.groupby('position_group')['xg_rel'].rank(pct=True) * 100
+
+    # Icetime percentile: how much this player actually plays, ranked
+    # within position group. Folded into every composite below so heavy,
+    # trusted minutes get rewarded and thin/sheltered samples get
+    # correctly discounted -- validated against a real case (a
+    # thin-sample, sheltered defenseman inflating a raw defense score to
+    # 80th percentile; icetime pulled him down to a more honest 61st,
+    # while legitimate full-workload players were barely affected).
+    ev['icetime_pctl'] = ev.groupby('position_group')['icetime'].rank(pct=True) * 100
+
+    # PP needs to be computed and merged in before the offense composite,
+    # since the composite formula uses pp_pctl as one of its inputs.
     pp = df[df['situation'] == '5on4'].copy()
     pp = pp[pp['icetime'] >= 30].copy()
     pp['pp_points'] = pp['I_F_goals'] + pp['I_F_primaryAssists'] + pp['I_F_secondaryAssists']
     pp['pp_points_per60'] = pp['pp_points'] / pp['icetime'] * 3600
     pp['pp_pctl'] = pp.groupby('position_group')['pp_points_per60'].rank(pct=True) * 100
+    ev = ev.merge(pp[['playerId', 'pp_pctl']], on='playerId', how='left')
+
+    # --- Offense composite: same formula for both positions ---
+    ev['raw_offense'] = (
+        ev['ev_offence_pctl'] * 0.25 + ev['finishing_pctl'] * 0.25 + ev['pp_pctl'].fillna(50) * 0.25 +
+        ev['fenwick_rel_pctl'] * 0.125 + ev['xg_rel_pctl'] * 0.125
+    )
+    ev['offense_composite'] = ev['raw_offense'] * 0.75 + ev['icetime_pctl'] * 0.25
+
+    # --- Defense composite: DIFFERENT formula per position, both
+    # independently backtested. Forwards: Blocks/Takeaways only -- every
+    # attempt to add more stats (EV Defence, danger tiers) *weakened*
+    # discrimination between real defensive-reputation and offense-first
+    # forwards, so the simpler 2-stat formula is the validated optimum.
+    # Defensemen: the fuller 5-stat blend. Blocks weight was lowered from
+    # an earlier 35% after finding it unfairly punished positioning-based
+    # defenders (a real, validated shutdown-caliber D-man scored poorly
+    # purely for not physically blocking many shots, despite elite
+    # High/Low-Danger suppression) -- Medium/High Danger raised instead,
+    # since positioning that prevents dangerous chances in the first
+    # place is at least as valid a defensive skill as blocking them after
+    # the fact. This costs a small amount of group-level discrimination
+    # (~34 -> ~30 point gap between real defensive-rep and offense-first
+    # D) in exchange for not misjudging that specific real playing style.
+    f_mask = ev['position_group'] == 'F'
+    d_mask = ev['position_group'] == 'D'
+    ev['raw_defense'] = None
+    ev.loc[f_mask, 'raw_defense'] = ev.loc[f_mask, 'blocks_pctl'] * 0.60 + ev.loc[f_mask, 'takeaways_pctl'] * 0.40
+    ev.loc[d_mask, 'raw_defense'] = (
+        ev.loc[d_mask, 'blocks_pctl'] * 0.20 + ev.loc[d_mask, 'md_def_pctl'] * 0.35 +
+        ev.loc[d_mask, 'hd_def_pctl'] * 0.25 + ev.loc[d_mask, 'ld_def_pctl'] * 0.10 +
+        ev.loc[d_mask, 'hits_pctl'] * 0.10
+    )
+    ev['raw_defense'] = ev['raw_defense'].astype(float)
+    ev['defense_composite'] = ev['raw_defense'] * 0.75 + ev['icetime_pctl'] * 0.25
 
     pk = df[df['situation'] == '4on5'].copy()
     pk = pk[pk['icetime'] >= 30].copy()
     pk['pk_xga_per60'] = pk['OnIce_A_xGoals'] / pk['icetime'] * 3600
-    pk['pk_pctl'] = 100 - (pk.groupby('position_group')['pk_xga_per60'].rank(pct=True) * 100)
+    pk['pk_results_pctl'] = 100 - (pk.groupby('position_group')['pk_xga_per60'].rank(pct=True) * 100)
+
+    # Forwards: PK on-ice RESULTS were validated (across 3 real seasons) to
+    # run backwards -- offense-first stars like Pastrnak scored ~95th
+    # percentile every single year despite no defensive reputation, while
+    # genuine Selke-caliber centers trended down. PK ICE TIME (how much a
+    # coach actually trusts a player shorthanded) showed a real, correctly-
+    # signed ~40-point group gap instead, so forwards use deployment here.
+    # Defensemen weren't separately validated for this, so they keep the
+    # original results-based measure.
+    pk['pk_toi_per_gp'] = pk['icetime'] / pk['games_played'] / 60
+    forward_pk_deployment_pctl = pk[pk['position_group'] == 'F']['pk_toi_per_gp'].rank(pct=True) * 100
+    pk['pk_pctl'] = pk['pk_results_pctl']
+    pk.loc[forward_pk_deployment_pctl.index, 'pk_pctl'] = forward_pk_deployment_pctl
 
     result = ev[['playerId', 'name', 'team', 'position', 'position_group', 'games_played',
                  'ev_offence_pctl', 'ev_defence_pctl', 'goals_pctl',
-                 'a1_pctl', 'finishing_pctl', 'penalties_pctl']].copy()
-    result = result.merge(pp[['playerId', 'pp_pctl']], on='playerId', how='left')
+                 'a1_pctl', 'finishing_pctl', 'penalties_pctl', 'pp_pctl',
+                 'blocks_pctl', 'hd_def_pctl', 'md_def_pctl', 'ld_def_pctl', 'hits_pctl',
+                 'takeaways_pctl', 'fenwick_rel_pctl', 'xg_rel_pctl', 'icetime_pctl',
+                 'offense_composite', 'defense_composite']].copy()
     result = result.merge(pk[['playerId', 'pk_pctl']], on='playerId', how='left')
 
     # --- Real season totals, for display alongside the percentiles ---
@@ -166,13 +252,34 @@ def get_player_card(name, skater_league, goalie_league):
 
 
 # ---------------------------------------------------------------------
-# STEP 2: The chart function, adapted from what we just tested.
+# STEP 2: The chart function.
 # ---------------------------------------------------------------------
 
-SKATER_LABELS = {
-    "ev_offence_pctl": "EV Offence", "ev_defence_pctl": "EV Defence",
-    "pp_pctl": "PP", "pk_pctl": "PK", "finishing_pctl": "Finishing",
-    "goals_pctl": "Goals", "a1_pctl": "1st Assists", "penalties_pctl": "Penalties",
+# Ordered offensive -> defensive so the bar chart reads left-to-right as
+# a spectrum, not an arbitrary stat order.
+FORWARD_LABELS = {
+    "goals_pctl": "Goals", "a1_pctl": "1st Assists", "finishing_pctl": "Finishing",
+    "ev_offence_pctl": "EV Offence", "pp_pctl": "PP",
+    "fenwick_rel_pctl": "Fenwick Rel", "xg_rel_pctl": "xG Rel",
+    "penalties_pctl": "Penalties", "pk_pctl": "PK", "ev_defence_pctl": "EV Defence",
+    "takeaways_pctl": "Takeaways", "blocks_pctl": "Blocks",
+    "defense_composite": "Overall Defense",
+}
+
+# Defensemen get the same base set, plus the granular defensive breakdown
+# validated specifically for this position (Blocks, danger-tier suppression,
+# Hits) -- these discriminate real defensive quality far better for D than
+# the single EV Defence number alone, which is kept too for continuity.
+# Fenwick/xG Rel sit in the middle since they measure overall two-way
+# on-ice impact, not purely one side of the puck.
+DEFENSEMAN_LABELS = {
+    "goals_pctl": "Goals", "a1_pctl": "1st Assists", "finishing_pctl": "Finishing",
+    "ev_offence_pctl": "EV Offence", "pp_pctl": "PP",
+    "fenwick_rel_pctl": "Fenwick Rel", "xg_rel_pctl": "xG Rel",
+    "penalties_pctl": "Penalties", "pk_pctl": "PK", "ev_defence_pctl": "EV Defence",
+    "hits_pctl": "Hits", "blocks_pctl": "Blocks",
+    "ld_def_pctl": "Low Danger Def", "md_def_pctl": "Medium Danger Def",
+    "hd_def_pctl": "High Danger Def", "defense_composite": "Overall Defense",
 }
 
 GOALIE_LABELS = {
@@ -186,7 +293,9 @@ def plot_player_card(row, stat_labels):
     labels = list(stat_labels.values())
     values = [row.get(s, None) for s in stats]
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    # Width scales with number of bars so labels don't get cramped when a
+    # defenseman's extra stats push the count up to 16.
+    fig, ax = plt.subplots(figsize=(0.6 * len(stats) + 1.5, 6))
 
     colors = []
     for v in values:
@@ -197,17 +306,18 @@ def plot_player_card(row, stat_labels):
             colors.append((1 - t, t, 0.0))
 
     display_values = [0 if (v is None or pd.isna(v)) else v for v in values]
-    bars = ax.barh(labels, display_values, color=colors)
+    bars = ax.bar(labels, display_values, color=colors)
 
     for bar, v in zip(bars, values):
         label = "NA" if (v is None or pd.isna(v)) else f"{v:.0f}%"
-        ax.text(max(bar.get_width() + 2, 4), bar.get_y() + bar.get_height() / 2,
-                 label, va="center", fontsize=10)
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
+                 label, ha="center", fontsize=10, rotation=90 if len(stats) > 10 else 0,
+                 va="bottom")
 
-    ax.set_xlim(0, 110)
-    ax.invert_yaxis()
+    ax.set_ylim(0, 115)
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
     ax.set_title(f"{row['name']} -- Percentile Rankings")
-    ax.set_xlabel("Percentile vs. peers")
+    ax.set_ylabel("Percentile vs. peers")
     plt.tight_layout()
     return fig
 
@@ -229,13 +339,28 @@ def render_player_card(kind, row):
         col4.metric("Points", int(row['season_points']))
         col5.metric("PIM", int(row['pim']))
         col6.metric("Avg TOI", f"{row['avg_toi_min']:.1f} min")
+
+        # Composite offense/defense scores, shown separately from the
+        # detailed percentile chart below. Each is a weighted blend of
+        # several individual stats plus icetime (so heavy, trusted
+        # minutes are rewarded and thin/sheltered samples are correctly
+        # discounted) -- see METHODOLOGY notes in the glossary below for
+        # exactly what goes into each one.
+        comp_col1, comp_col2 = st.columns(2)
+        comp_col1.metric("Composite Offense", f"{row['offense_composite']:.0f}%")
+        comp_col2.metric("Composite Defense", f"{row['defense_composite']:.0f}%")
     else:
         col1, col2, col3 = st.columns(3)
         col1.metric("Games Played", int(row['games_played']))
         col2.metric("Save %", f"{row['save_pct']:.3f}")
         col3.metric("GAA", f"{row['gaa']:.2f}")
 
-    labels = SKATER_LABELS if kind == "skater" else GOALIE_LABELS
+    if kind == "goalie":
+        labels = GOALIE_LABELS
+    elif row.get('position_group') == 'D':
+        labels = DEFENSEMAN_LABELS
+    else:
+        labels = FORWARD_LABELS
     fig = plot_player_card(row, labels)
     st.pyplot(fig)
 
@@ -311,7 +436,7 @@ def render_three_year_trend(kind, name):
 
 
 # ---------------------------------------------------------------------
-# STEP 3: The actual Streamlit interface. This part is new syntax.
+# STEP 3: The actual Streamlit interface.
 # ---------------------------------------------------------------------
 
 st.title("Hockeydex")
@@ -333,19 +458,72 @@ forwards, defensemen vs. defensemen, goalies vs. goalies) with a minimum games-p
 cutoff applied, so a 50th percentile always means "middle of the pack for this role,"
 not "average across the whole league."
 
+#### Composite Offense / Composite Defense
+
+Shown as two summary numbers above the detailed chart, blending several individual
+stats plus **icetime** (so heavy, trusted minutes are rewarded and thin/sheltered
+samples are correctly discounted -- validated against a real case where a
+thin-sample, sheltered defenseman's raw defense score dropped from an inflated 80th
+percentile to a more honest 61st once icetime was factored in).
+
+- **Composite Offense** (same formula for forwards and defensemen): EV Offence 25% +
+  Finishing 25% + PP 25% + Fenwick Rel 12.5% + xG Rel 12.5%, then blended 75/25 with
+  icetime. Fenwick/xG Rel check whether the team's play actually improves with this
+  player on the ice, not just whether they personally accumulate points -- catches
+  cases where strong raw production comes from sheltered deployment or elite
+  linemates rather than genuinely driving offense.
+- **Composite Defense** (different formula per position, both independently
+  backtested against real defensive-reputation vs. offense-first players):
+    - **Forwards:** Blocks 60% + Takeaways 40%. Every attempt to add more stats
+      (EV Defence, danger-tier suppression) actually *weakened* the separation
+      between real defensive-minded forwards and offense-first ones, so this
+      simpler formula is the validated optimum here.
+    - **Defensemen:** Blocks 20% + Medium Danger 35% + High Danger 25% + Low
+      Danger 10% + Hits 10%. Blocks carries less weight here than an earlier
+      version, after finding it unfairly penalized positioning-based defenders
+      who prevent dangerous chances without racking up blocked-shot totals.
+
 #### Skater stats
 
 - **EV Offence** -- Individual scoring rate (goals + assists) at 5-on-5, per 60 minutes.
 - **EV Defence** -- How many expected goals were allowed while this player was on the ice
   at 5-on-5 (fewer is better). Team-level, not solely this player's fault.
 - **PP** -- Power-play scoring rate, same idea as EV Offence but isolated to the man advantage.
-- **PK** -- Penalty-kill defensive rate, same idea as EV Defence but isolated to shorthanded play.
+- **PK** -- Penalty-kill rate. For **defensemen**, this is on-ice results (expected goals
+  allowed while shorthanded). For **forwards**, this is **ice time** instead --
+  validated across 3 real seasons that PK results run backwards for forwards (pure
+  scorers like Pastrnak scored ~95th percentile every year despite no defensive
+  reputation, while real shutdown centers trended down); how much a coach actually
+  trusts a forward shorthanded turned out to be the correctly-signed signal.
 - **Finishing** -- Goals actually scored vs. expected goals from this player's own shots.
   A high number means outscoring their shot quality (elite shooting, or possibly a hot
   streak that won't fully repeat -- shooting stats are less consistent year to year than
   most others here).
 - **Goals / 1st Assists** -- Straightforward scoring-rate stats.
 - **Penalties** -- Net penalty differential (drawn minus taken) per 60 minutes.
+
+**Forwards only -- defensive breakdown:**
+
+- **Takeaways** and **Blocks** -- individually-attributable defensive actions. Validated
+  as the two strongest stats for telling apart real defensive-minded forwards from
+  offense-first ones. Unlike defensemen, danger-tier suppression and EV Defence didn't
+  add real signal here once tested, so they're left out of this position's breakdown.
+
+**Defensemen only -- additional granular defense breakdown:**
+
+- **Blocks** -- Individual shot-blocking rate.
+- **High/Medium/Low Danger Def** -- On-ice expected goals allowed, split by how
+  dangerous the shot was, each inverted so a higher percentile means better suppression.
+  Medium Danger is the single strongest individual signal for this position.
+- **Hits** -- Individual hit rate. Unlike forwards (where hits are a weak, sometimes
+  backwards signal), hits show real, positive defensive signal specifically for
+  defensemen.
+- **Fenwick Rel / xG Rel** -- see Composite Offense above; shown here individually too.
+
+Takeaways and defensive-zone giveaways were tested for defensemen specifically and
+dropped from their formula: both showed backwards (negative) discrimination between
+real shutdown-reputation and offense-first defensemen on this position, meaning they
+added noise rather than signal here (even though Takeaways works well for forwards).
 
 **Not included:** Competition and Teammates (how tough their opponents/linemates are) --
 these require play-by-play regression modeling (RAPM), not just season totals, so they're
@@ -434,6 +612,7 @@ if chosen_name:
 SKATER_LEADERBOARD_COLUMNS = {
     "games_played": "GP", "season_goals": "Goals", "season_assists": "Assists",
     "season_points": "Points", "pim": "PIM", "avg_toi_min": "Avg TOI",
+    "offense_composite": "Composite Offense", "defense_composite": "Composite Defense",
     "ev_offence_pctl": "EV Offence %ile", "ev_defence_pctl": "EV Defence %ile",
     "pp_pctl": "PP %ile", "pk_pctl": "PK %ile", "finishing_pctl": "Finishing %ile",
     "penalties_pctl": "Penalties %ile",
