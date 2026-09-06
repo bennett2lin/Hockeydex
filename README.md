@@ -1,6 +1,6 @@
 # Hockeydex - (https://hockeydex.streamlit.app/)
 
-Live NHL percentile cards and leaderboards for any skater or goalie, any
+Vibe-coding - live NHL percentile cards and leaderboards for any skater or goalie, any
 season since 2008-09, built with Streamlit and MoneyPuck data.
 
 Built by [bennett2lin](https://github.com/bennett2lin).
